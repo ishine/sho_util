@@ -10,6 +10,7 @@ import shutil
 import os
 import pandas as pd
 import glob
+import scipy.stats as st
 
 def pickle_save(data, path):
     """
@@ -303,10 +304,14 @@ def select_from_pathlist(path_list, included="all", excluded="None", selection_m
         new_path_list = path_list[np.array(bool_list,dtype=bool)]
     return new_path_list
 
-def get_outliers(values):
+def get_outliers(values, get_bool=False):
     q1, q3 = np.quantile(values, [0.25,0.75])
     iqr = q3-q1
-    return (q1-1.5*iqr<=values)*(q3+1.5*iqr>=values)
+    if get_bool:
+        result = (q1-1.5*iqr<=values)*(q3+1.5*iqr>=values)
+    else:
+        result = values[(q1-1.5*iqr<=values)*(q3+1.5*iqr>=values)]
+    return result
 
 def compute_mean_nooutliers(values):
     bool_list = get_outliers(values)
@@ -315,7 +320,16 @@ def compute_mean_nooutliers(values):
 
 ### Latex Text Generation from Pandas DataFrame ###
 
-def get_latex_from_pandas(meandf, columns, indices, title="Title", label="Label", itvldf=None, multicolumns={}, multiindices={}, midrules=[], hdashedlines=[], pm_list=[], baseround_list=[], comparison=[], highestmin=[], twocolumn=False, tableratio=1.0, colorize=False, bestdf=None, remove_indices=False, captionbelow=False):
+def get_mean_interval(values, remove_outliers):
+    values = values.astype(float)
+    if remove_outliers:
+        values = get_outliers(values)
+    ivl = st.t.interval(confidence=0.95, df=len(values)-1, loc=np.mean(values), scale=st.sem(values)) 
+    ivl = float((ivl[1]-ivl[0])/2)
+    mean = float(np.mean(values))
+    return mean, ivl
+
+def get_latex_from_pandas(meandf, columns, indices, title="Title", label="Label", itvldf=None, multicolumns={}, multiindices={}, midrules=[], hdashedlines=[], pm_list=[], baseround_list=[], comparison=[], highestmin=[], twocolumn=False, tableratio=1.0, colorize=False, bestdf=None, secondbestdf=None, remove_indices=False, captionbelow=False):
     """
     To plot spectrogram or mel-spectrogram with a simple command.
 
@@ -415,25 +429,58 @@ def get_latex_from_pandas(meandf, columns, indices, title="Title", label="Label"
         
     
     """
-    if len(baseround_list)==0:
-        baseround_list = [3]*len(columns)
-    if colorize:
-        maxval = max(df.values.max(), (-df.values).max())
+    # Reorder dataframe according to `indices` (list of (key, latex_name))
+    meandf = meandf.loc[[l[0] for l in indices], list(columns.keys())]
 
-    indexnum = 1 + int(len(multiindices))
-    if type(bestdf)==type(None):
-        flip = np.array([(-1)**int(idx in highestmin) for idx in range(len(columns))]).reshape(1, -1)
-        bestdf = meandf.copy()
+    if len(baseround_list) == 0:
+        baseround_list = [3] * len(columns)
+    if colorize:
+        maxval = max(meandf.values.max(), (-meandf.values).max())
+
+    # If multiindices is used, we add one more index column (group column)
+    indexnum = 1 + int(bool(len(multiindices)))
+
+    # Prepare bestdf
+    get_bestdf = type(bestdf) == type(None)
+    get_secondbestdf = type(secondbestdf) == type(None)
+    if get_bestdf or get_secondbestdf:
+        flip = np.array([(-1) ** int(idx in highestmin) for idx in range(len(columns))]).reshape(1, -1)
+        if get_bestdf:
+            bestdf = meandf.copy()
+            bestdf[:] = 0.0
+        if get_secondbestdf:
+            secondbestdf = meandf.copy()
+            secondbestdf[:] = 0.0
         valuedf = meandf.copy()
-        valuedf = valuedf.applymap(lambda x: np.nan if isinstance(x, str) else x)*flip
-        bestdf[:] = 0.0
-        if len(comparison)>0:
-            if type(comparison[0])==int:
-                bestdf.iloc[comparison] = (valuedf.iloc[comparison]==np.nanmax(valuedf.iloc[comparison].values, axis=0, keepdims=True).astype(float)).astype(float)
+        valuedf = valuedf.applymap(lambda x: np.nan if isinstance(x, str) else x) * flip
+        if len(comparison) > 0:
+            if type(comparison[0]) == int:
+                if get_bestdf:
+                    maxvalues = np.array([np.sort(array*(-1.0))[0]*(-1.0) for array in valuedf.iloc[comparison].values.T]).reshape(1, -1)
+                    bestdf.iloc[comparison] = (valuedf.iloc[comparison] == maxvalues.astype(float)).astype(float)
+                if get_secondbestdf:
+                    secondmaxvalues = np.array([np.sort(array*(-1.0))[1]*(-1.0) for array in valuedf.iloc[comparison].values.T]).reshape(1, -1)
+                    secondbestdf.iloc[comparison] = (valuedf.iloc[comparison] == secondmaxvalues.astype(float)).astype(float)
             else:
                 for comp in comparison:
-                    bestdf.iloc[comp] = (valuedf.iloc[comp]==np.nanmax(valuedf.iloc[comp].values, axis=0, keepdims=True).astype(float)).astype(float)
+                    if get_bestdf:
+                        maxvalues = np.array([np.sort(array*(-1.0))[0]*(-1.0) for array in valuedf.iloc[comp].values.T]).reshape(1, -1)
+                        bestdf.iloc[comp] = (valuedf.iloc[comp] == maxvalues.astype(float)).astype(float)
+                    if get_secondbestdf:
+                        secondmaxvalues = np.array([np.sort(array*(-1.0))[1]*(-1.0) for array in valuedf.iloc[comp].values.T]).reshape(1, -1)
+                        secondbestdf.iloc[comp] = (valuedf.iloc[comp] == secondmaxvalues.astype(float)).astype(float)
 
+    # ----- Build multiindex group information -----
+    # multiindices = { "GroupName1": span1, "GroupName2": span2, ... }
+    group_info = []
+    if len(multiindices) > 0:
+        start_row = 0
+        for gname, span in multiindices.items():
+            group_info.append((start_row, span, gname))
+            start_row += span
+        # Any rows beyond sum(span) will have empty group cell
+
+    # ----- LaTeX table header -----
     if twocolumn:
         print("\\begin{table*}[!h]")
     else:
@@ -441,86 +488,132 @@ def get_latex_from_pandas(meandf, columns, indices, title="Title", label="Label"
     print("\caption{" + title + "}")
     print("\label{table:" + label + "}")
     print("\\centering")
-    print(f"\scalebox{{{tableratio}}}{{")
+    print(f"\\scalebox{{{tableratio}}}{{")
     cl_def = ""
-    if not(remove_indices):
-        cl_def += "l"*(indexnum)
-    cl_def += "c"*len(columns)
+    if not (remove_indices):
+        cl_def += "l" * (indexnum)
+    cl_def += "c" * len(columns)
 
     text = "\\begin{tabular}{" + cl_def + "}"
     print(text)
     print("\\toprule")
-    if len(multicolumns)>0:
-        a = " & ".join([""]*(indexnum) + [f"\multicolumn{{{multicolumns[key]}}}{{c}}{{{key}}}" for key in multicolumns]) + "\\\\"
-        print(a[2*int(remove_indices):])
+
+    # Multicolumn header (for columns)
+    if len(multicolumns) > 0:
+        a = " & ".join([""] * (indexnum) +
+                       [f"\\multicolumn{{{multicolumns[key]}}}{{c}}{{{key}}}" for key in multicolumns]) + "\\\\"
+        print(a[2 * int(remove_indices):])
         linetxt = ""
         if remove_indices:
             start = indexnum
         else:
-            start = indexnum+1
+            start = indexnum + 1
         for key in multicolumns:
-            end = start+multicolumns[key]-1
+            end = start + multicolumns[key] - 1
             linetxt += f"\\cmidrule(lr){{{start}-{end}}}"
-            start = end+1
+            start = end + 1
         print(linetxt)
-    a = f" & ".join([""]*(indexnum+1) + list(columns.values()))[2:] + "\\\\"
-    print(a[3*int(remove_indices):])
-    print(f"\midrule")
+
+    # Column names row
+    a = f" & ".join([""] * (indexnum + 1) + list(columns.values()))[2:] + "\\\\"
+    print(a[3 * int(remove_indices):])
+    print(f"\\midrule")
+
+    # ----- Body -----
     for i in range(len(indices)):
-        key = list(indices.keys())[i]
-        keyname = indices[key]
-        if remove_indices:
-            start = f""
-        else:
-            start = f"{keyname} &"
+        key = indices[i][0]
+        keyname = indices[i][1]
+
+        # Build index cells (left side)
+        index_cells = []
+        if not remove_indices:
+            # If we use multiindices, first index column is the group (multirow)
+            if len(multiindices) > 0:
+                group_cell = ""
+                for start, span, gname in group_info:
+                    if i == start:
+                        # first row of group: place \multirow cell
+                        group_cell = f"\\multirow{{{span}}}{{*}}{{{gname}}}"
+                        break
+                    elif start < i < start + span:
+                        # inside a group but not first row: empty cell
+                        group_cell = ""
+                        break
+                # Rows not in any group also get empty group_cell
+                index_cells.append(group_cell)
+
+            # Second index column (or the only one if no multiindices)
+            index_cells.append(keyname)
+
+        # Build value cells
         vlist = []
         for k in range(len(columns)):
             base_round = baseround_list[k]
             valuekey = list(columns.keys())[k]
-            v = meandf.loc[key, valuekey]
-            if str(v)=="nan":
+            v = meandf.iloc[i, k]
+
+            if str(v) == "nan":
                 vstr = "-"
             else:
-                if base_round==0:
+                if base_round == 0:
                     v = int(v)
                     val = f"{v}"
                 else:
-                    if v==0:
-                        val = "0."+"0"*base_round
+                    if v == 0:
+                        val = "0." + "0" * base_round
                     else:
-                        if type(v)==str:
+                        if type(v) == str:
                             val = v
                         else:
-                            v = np.round(v,base_round)
-                            val = f"{v}".ljust(int(np.log10(v))+base_round+2, '0')
-                if colorize and v!=0:
-                    color = "blue" if v>0 else "red"
-                    # val = f"\\cellcolor{{{color}!{abs(int(100*float(v)/maxval))}}}{{{val}}}"
-                    if abs(v)<50:
+                            v = np.round(v, base_round)
+                            # pad with zeros to keep fixed decimal places
+                            # val = f"{v}".ljust(int(np.log10(abs(v))) + base_round + 2, '0') if v != 0 else f"{v}"
+                            # val = f"{float(v)}".ljust(int(np.log10(abs(v))) + int(v*10e8%10==0) + base_round + 2, '0') if v != 0 else f"{v}"
+                            # a = np.log10(abs(v))
+                            # val = f"{float(v)}".ljust(int(np.log10(abs(v))) + int(a-int(a)==0) + base_round + 2, '0') if v != 0 else f"{v}"
+                            val = f"{float(v)}".ljust(int(np.log10(abs(v))) + base_round + 2 + 5, '0')[:base_round+2+int(float(v)<0)]
+                if colorize and v != 0 and not isinstance(v, str):
+                    color = "blue" if v > 0 else "red"
+                    if abs(v) < 50:
                         color = f"{color}!60"
                     val = f"\\textcolor{{{color}}}{{{val}}}"
                 vstr = str(val)
-                if bestdf.loc[key, valuekey]==1.0:
+
+                # Bold best values
+                if bestdf.iloc[i, k] == 1.0:
                     vstr = f"\\textbf{{{vstr}}}"
+                elif secondbestdf.iloc[i, k] == 1.0:
+                    vstr = f"\\underline{{{vstr}}}"
+
+            # Interval (±) if requested
             if k in pm_list:
-                ivl = itvldf.loc[key, valuekey]
-                ivl = f"{np.round(ivl,base_round)}".ljust(base_round+2, '0')
-                vstr = vstr + f"{{\\tiny $\\pm$ {{{ivl}}} }}"
-            vlist += [vstr]
-        print(start + " & ".join(vlist) + "\\\\")
-        if i+1 in midrules:
-            print("\midrule")
-        if i+1 in hdashedlines:
-            print("\\addlinespace[0.1em]\\hdashline\\addlinespace[0.3em]")
+                if type(itvldf)!=type(None):
+                    ivl = itvldf.loc[key, valuekey]
+                    if str(ivl) != "nan":
+                        ivl = f"{np.round(ivl, base_round)}".ljust(base_round + 2, '0')
+                        vstr = vstr + f"{{\\tiny $\\pm$ {{{ivl}}} }}"
+
+            vlist.append(vstr)
+
+        # Combine index cells + value cells
+        row_cells = index_cells + vlist
+        print(" & ".join(row_cells) + "\\\\")
+        if i + 1 in midrules:
+            print("\\midrule")
+        if i + 1 in hdashedlines:
+            start = int(bool(len(multiindices)))+1
+            end = len(columns)+start
+            print(f"\\addlinespace[0.1em]\\cdashline{{{start}-{end}}}\\addlinespace[0.3em]")
+
     print("\\bottomrule")
-    print("\end{tabular}")
+    print("\\end{tabular}")
     print("}")
     if captionbelow:
-        print(f"\caption*{{{captionbelow}}}")
+        print(f"\\caption*{{{captionbelow}}}")
     if twocolumn:
-        print("\end{table*}")
+        print("\\end{table*}")
     else:
-        print("\end{table}")
+        print("\\end{table}")
     return bestdf
 
 
